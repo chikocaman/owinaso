@@ -1,0 +1,6 @@
+[functions]
+  node_bundler = "esbuild"
+
+[[scheduled.functions]]
+  path = "/.netlify/functions/check"
+  schedule = "*/1 * * * *"

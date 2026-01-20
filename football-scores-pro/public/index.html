@@ -1,0 +1,255 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <link rel="manifest" href="/manifest.webmanifest">
+  <title>Football Scores Pro</title>
+  <style>
+    body{font-family:system-ui,Segoe UI,Roboto,Arial;margin:0;background:#0b1220;color:#e7eefc}
+    .wrap{max-width:1100px;margin:0 auto;padding:16px}
+    .row{display:flex;gap:12px;flex-wrap:wrap}
+    .card{background:#111b33;border:1px solid #243055;border-radius:14px;padding:14px}
+    button{background:#2a5bd7;border:none;color:#fff;padding:10px 12px;border-radius:10px;cursor:pointer}
+    button:disabled{opacity:.5;cursor:not-allowed}
+    input[type="checkbox"]{transform:scale(1.2)}
+    .muted{opacity:.8}
+    .pill{display:inline-block;padding:3px 8px;border-radius:999px;background:#1d2a52;border:1px solid #2b3a69;font-size:12px}
+    .match{display:flex;justify-content:space-between;gap:10px;align-items:center}
+    .small{font-size:12px;opacity:.85}
+    .toast{position:fixed;bottom:16px;left:50%;transform:translateX(-50%);background:#0f1a35;border:1px solid #243055;padding:10px 12px;border-radius:12px;display:none}
+  </style>
+</head>
+<body>
+<div class="wrap">
+  <h2>Football Scores Pro</h2>
+
+  <div class="row">
+    <div class="card" style="flex:1;min-width:320px">
+      <div class="row" style="align-items:center;justify-content:space-between">
+        <div>
+          <div><b>Push Notifications</b></div>
+          <div class="small muted">Works like WhatsApp (requires HTTPS / Netlify is OK). Install as PWA on Android for best reliability.</div>
+        </div>
+        <span class="pill" id="pushStatus">Not enabled</span>
+      </div>
+      <div class="row" style="margin-top:10px">
+        <button id="enablePushBtn">Enable Push</button>
+        <button id="testPushBtn">Test Notification</button>
+      </div>
+      <hr style="border:0;border-top:1px solid #243055;margin:14px 0">
+      <div class="row">
+        <label class="row" style="align-items:center;gap:8px"><input id="notifyKick" type="checkbox"> Kickoff</label>
+        <label class="row" style="align-items:center;gap:8px"><input id="notifyHT" type="checkbox"> Half Time</label>
+        <label class="row" style="align-items:center;gap:8px"><input id="notifyGoal" type="checkbox" checked> Goals</label>
+        <label class="row" style="align-items:center;gap:8px"><input id="notifyFT" type="checkbox"> Full Time</label>
+      </div>
+      <div class="small muted" style="margin-top:8px">
+        These toggles affect server push output (Netlify function uses your settings).
+      </div>
+    </div>
+
+    <div class="card" style="flex:1;min-width:320px">
+      <b>Output Format</b>
+      <div class="small muted">Copy output is strict. No postponed line, no “no goals yet”, no “(4-2 on penalties)”.</div>
+      <div class="row" style="margin-top:10px">
+        <label class="row" style="align-items:center;gap:8px"><span>Prefix</span>
+          <input id="prefix" value="$" style="width:60px;padding:8px;border-radius:10px;border:1px solid #243055;background:#0f1a35;color:#e7eefc">
+        </label>
+        <label class="row" style="align-items:center;gap:8px">
+          <input id="formatCombined" type="checkbox">
+          Combined format
+        </label>
+      </div>
+    </div>
+  </div>
+
+  <div class="card" style="margin-top:14px">
+    <div class="row" style="align-items:center;justify-content:space-between">
+      <b>Live Matches</b>
+      <button id="refreshBtn">Refresh</button>
+    </div>
+    <div class="small muted">UI refresh is separate. Real WhatsApp-like notifications come from Push (server).</div>
+    <div id="matches" style="margin-top:12px"></div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+  const $ = (id) => document.getElementById(id);
+  function toast(msg){
+    const t = $("toast"); t.textContent = msg; t.style.display="block";
+    clearTimeout(window.__toastT);
+    window.__toastT=setTimeout(()=>t.style.display="none",2000);
+  }
+
+  const SETTINGS_KEY = "fsp_settings_v2";
+  function loadSettings(){
+    try { return JSON.parse(localStorage.getItem(SETTINGS_KEY) || "{}"); } catch { return {}; }
+  }
+  function saveSettings(patch){
+    const cur = loadSettings();
+    const next = { ...cur, ...patch };
+    localStorage.setItem(SETTINGS_KEY, JSON.stringify(next));
+    return next;
+  }
+  function applySettings(){
+    const s = loadSettings();
+    $("prefix").value = s.prefix ?? "$";
+    $("formatCombined").checked = !!s.formatCombined;
+    $("notifyKick").checked = !!s.notifyKick;
+    $("notifyHT").checked = !!s.notifyHT;
+    $("notifyGoal").checked = (s.notifyGoal ?? true);
+    $("notifyFT").checked = !!s.notifyFT;
+  }
+
+  ["prefix","formatCombined","notifyKick","notifyHT","notifyGoal","notifyFT"].forEach(id=>{
+    $(id).addEventListener("change", ()=>{
+      saveSettings({
+        prefix: $("prefix").value || "$",
+        formatCombined: $("formatCombined").checked,
+        notifyKick: $("notifyKick").checked,
+        notifyHT: $("notifyHT").checked,
+        notifyGoal: $("notifyGoal").checked,
+        notifyFT: $("notifyFT").checked
+      });
+      if (window.__subscribed) updateServerPrefs();
+    });
+  });
+
+  async function registerSW(){
+    if (!("serviceWorker" in navigator)) return false;
+    const reg = await navigator.serviceWorker.register("/sw.js");
+    navigator.serviceWorker.addEventListener("message", async (e) => {
+      if (e.data?.type === "COPY_TO_CLIPBOARD") {
+        const text = e.data.text || "";
+        try {
+          await navigator.clipboard.writeText(text);
+          toast("Copied");
+        } catch {
+          const ta = document.createElement("textarea");
+          ta.value = text;
+          document.body.appendChild(ta);
+          ta.select();
+          document.execCommand("copy");
+          ta.remove();
+          toast("Copied");
+        }
+      }
+    });
+    return true;
+  }
+
+  async function enablePush(){
+    const swOk = await registerSW();
+    if (!swOk) { toast("Service Worker not supported"); return; }
+
+    const perm = await Notification.requestPermission();
+    if (perm !== "granted") { toast("Notifications not allowed"); return; }
+
+    const keyRes = await fetch("/.netlify/functions/subscribe", { method: "GET" });
+    const { vapidPublicKey } = await keyRes.json();
+
+    const reg = await navigator.serviceWorker.ready;
+    const sub = await reg.pushManager.subscribe({
+      userVisibleOnly: true,
+      applicationServerKey: urlBase64ToUint8Array(vapidPublicKey)
+    });
+
+    await fetch("/.netlify/functions/subscribe", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        subscription: sub,
+        prefs: loadSettings()
+      })
+    });
+
+    window.__subscribed = true;
+    $("pushStatus").textContent = "Enabled";
+    toast("Push enabled");
+  }
+
+  async function updateServerPrefs(){
+    const reg = await navigator.serviceWorker.ready;
+    const sub = await reg.pushManager.getSubscription();
+    if (!sub) return;
+    await fetch("/.netlify/functions/subscribe", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ subscription: sub, prefs: loadSettings() })
+    });
+  }
+
+  function urlBase64ToUint8Array(base64String) {
+    const padding = "=".repeat((4 - (base64String.length % 4)) % 4);
+    const base64 = (base64String + padding).replace(/-/g, "+").replace(/_/g, "/");
+    const raw = atob(base64);
+    const out = new Uint8Array(raw.length);
+    for (let i=0;i<raw.length;i++) out[i]=raw.charCodeAt(i);
+    return out;
+  }
+
+  $("enablePushBtn").addEventListener("click", enablePush);
+  $("testPushBtn").addEventListener("click", async ()=>{
+    await fetch("/.netlify/functions/push", {
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({ test: true })
+    });
+    toast("Test push sent");
+  });
+
+  async function refreshUI(){
+    $("refreshBtn").disabled = true;
+    try {
+      const res = await fetch("/.netlify/functions/check?mode=ui&_=" + Date.now(), { cache:"no-store" });
+      const data = await res.json();
+      renderMatches(data.matches || []);
+    } catch (e) {
+      renderMatches([]);
+      toast("Could not load matches");
+    } finally {
+      $("refreshBtn").disabled = false;
+    }
+  }
+
+  function renderMatches(matches){
+    const root = $("matches");
+    if (!matches.length) {
+      root.innerHTML = `<div class="muted">No matches loaded.</div>`;
+      return;
+    }
+    root.innerHTML = matches.map(m=>`
+      <div class="card" style="margin:10px 0">
+        <div class="match">
+          <div>
+            <div class="small muted">${escapeHtml(m.league)} • ${escapeHtml(m.statusText)}</div>
+            <div><b>${escapeHtml(m.homeTeam)}</b> ${m.homeScore} - ${m.awayScore} <b>${escapeHtml(m.awayTeam)}</b></div>
+          </div>
+          <button data-copy="${escapeHtml(m.copyAll || "")}" ${m.copyAll ? "" : "disabled"}>Copy</button>
+        </div>
+      </div>
+    `).join("");
+
+    root.querySelectorAll("button[data-copy]").forEach(btn=>{
+      btn.addEventListener("click", async ()=>{
+        const text = btn.getAttribute("data-copy") || "";
+        if (!text) return;
+        try { await navigator.clipboard.writeText(text); toast("Copied"); }
+        catch { toast("Copy failed"); }
+      });
+    });
+  }
+
+  function escapeHtml(s){ return String(s||"").replace(/[&<>"']/g, m=>({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#039;" }[m])); }
+
+  $("refreshBtn").addEventListener("click", refreshUI);
+
+  applySettings();
+  registerSW().catch(()=>{});
+  refreshUI();
+</script>
+</body>
+</html>
